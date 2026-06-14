@@ -29,8 +29,10 @@ CHARS_PER_TOKEN = 4
 CONTEXT_TOKEN_BUDGET = 8_000
 
 # Claude Sonnet pricing (USD per 1M tokens)
-INPUT_PRICE_PER_M = 3.00
-OUTPUT_PRICE_PER_M = 15.00
+INPUT_PRICE_PER_M         = 3.00   # normal input
+CACHE_WRITE_PRICE_PER_M   = 3.75   # first call in 5-min window: slight premium to write cache
+CACHE_READ_PRICE_PER_M    = 0.30   # subsequent calls: 90% cheaper
+OUTPUT_PRICE_PER_M        = 15.00
 
 
 def estimate_tokens(text: str) -> int:
@@ -81,35 +83,62 @@ def apply_budget(ranked_items: list, budget: int = CONTEXT_TOKEN_BUDGET) -> tupl
     return selected, excluded, tokens_used
 
 
-def cost_report(input_tokens: int, output_tokens: int = 500) -> dict:
+def cost_report(
+    input_tokens: int,
+    output_tokens: int = 500,
+    cache_stats: dict = None,
+) -> dict:
     """
-    Estimate API cost for a single review call.
+    Estimate API cost for a single review call, accounting for cache hits/misses.
 
     Args:
         input_tokens:  Total tokens sent to the API (diff + context + system prompt)
         output_tokens: Expected output tokens (review text, default 500)
+        cache_stats:   {"created": N, "read": N} from response.usage
     """
-    input_cost = (input_tokens / 1_000_000) * INPUT_PRICE_PER_M
-    output_cost = (output_tokens / 1_000_000) * OUTPUT_PRICE_PER_M
-    total = input_cost + output_cost
+    cs = cache_stats or {"created": 0, "read": 0}
+
+    # Tokens that were NOT cached are billed at normal input rate
+    normal_tokens = input_tokens - cs["created"] - cs["read"]
+
+    input_cost  = (normal_tokens    / 1_000_000) * INPUT_PRICE_PER_M
+    write_cost  = (cs["created"]    / 1_000_000) * CACHE_WRITE_PRICE_PER_M
+    read_cost   = (cs["read"]       / 1_000_000) * CACHE_READ_PRICE_PER_M
+    output_cost = (output_tokens    / 1_000_000) * OUTPUT_PRICE_PER_M
+    total = input_cost + write_cost + read_cost + output_cost
+
+    # What it would have cost without caching
+    uncached_cost = (input_tokens / 1_000_000) * INPUT_PRICE_PER_M + output_cost
+    savings = uncached_cost - total
 
     return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "input_cost_usd": round(input_cost, 6),
-        "output_cost_usd": round(output_cost, 6),
-        "total_cost_usd": round(total, 6),
+        "input_tokens":          input_tokens,
+        "output_tokens":         output_tokens,
+        "cache_created_tokens":  cs["created"],
+        "cache_read_tokens":     cs["read"],
+        "input_cost_usd":        round(input_cost, 6),
+        "cache_write_cost_usd":  round(write_cost, 6),
+        "cache_read_cost_usd":   round(read_cost, 6),
+        "output_cost_usd":       round(output_cost, 6),
+        "total_cost_usd":        round(total, 6),
+        "savings_usd":           round(savings, 6),
         "cost_per_1000_prs_usd": round(total * 1000, 2),
     }
 
 
 def format_cost_report(report: dict) -> str:
+    cache_line = ""
+    if report["cache_created_tokens"] or report["cache_read_tokens"]:
+        cache_line = (
+            f"  Cache written:   {report['cache_created_tokens']:,} tokens (${report['cache_write_cost_usd']:.4f})\n"
+            f"  Cache read:      {report['cache_read_tokens']:,} tokens (${report['cache_read_cost_usd']:.4f})\n"
+            f"  Cache savings:   ${report['savings_usd']:.4f}\n"
+        )
     return (
         f"=== TOKEN & COST REPORT ===\n"
         f"  Input tokens:    {report['input_tokens']:,}\n"
         f"  Output tokens:   {report['output_tokens']:,}\n"
-        f"  Input cost:      ${report['input_cost_usd']:.4f}\n"
-        f"  Output cost:     ${report['output_cost_usd']:.4f}\n"
+        f"{cache_line}"
         f"  Total per PR:    ${report['total_cost_usd']:.4f}\n"
         f"  Cost per 1K PRs: ${report['cost_per_1000_prs_usd']:.2f}\n"
     )

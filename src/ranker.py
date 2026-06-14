@@ -15,11 +15,13 @@ from src.context_retriever import ContextItem
 
 
 PRIORITY_ORDER = {
-    'function_body': 1,
-    'call_site': 2,
-    'test': 3,
-    'type_def': 4,
-    'import': 5,
+    'function_body':  1,
+    'lsp_reference':  2,   # precise — same tier as call_site but listed first
+    'call_site':      2,
+    'semantic_match': 2,
+    'test':           3,
+    'type_def':       4,
+    'import':         5,
 }
 
 
