@@ -1,0 +1,51 @@
+diff --git a/payments/processor.py b/payments/processor.py
+index b1c2d3e..f4a5b6c 100644
+--- a/payments/processor.py
++++ b/payments/processor.py
+@@ -1,6 +1,7 @@
+ from dataclasses import dataclass
+ from typing import Optional
+ from auth.models import User
+-from auth.service import require_role
++from auth.service import require_role, is_session_valid
++from auth.models import Session
+
+
+ @dataclass
+@@ -10,12 +11,23 @@ class PaymentResult:
+     error: Optional[str] = None
+
+
+-def process_payment(user: User, amount: float, currency: str = "USD") -> PaymentResult:
+-    if not require_role(user, "user"):
+-        return PaymentResult(success=False, error="Unauthorized")
++def _validate_payment_amount(amount: float) -> Optional[str]:
++    if amount <= 0:
++        return "Amount must be positive"
++    if amount > 10_000:
++        return "Amount exceeds single-transaction limit"
++    return None
+
+-    if amount <= 0:
+-        return PaymentResult(success=False, error="Amount must be positive")
+
+-    if amount > 10_000:
+-        return PaymentResult(success=False, error="Amount exceeds single-transaction limit")
++def process_payment(
++    user: User,
++    session: Session,
++    amount: float,
++    currency: str = "USD"
++) -> PaymentResult:
++    if not is_session_valid(session):
++        return PaymentResult(success=False, error="Session expired")
++
++    if not require_role(user, "user"):
++        return PaymentResult(success=False, error="Unauthorized")
++
++    error = _validate_payment_amount(amount)
++    if error:
++        return PaymentResult(success=False, error=error)
+
+     import secrets
+     transaction_id = secrets.token_hex(16)

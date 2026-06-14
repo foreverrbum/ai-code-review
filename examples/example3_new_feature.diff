@@ -1,0 +1,60 @@
+diff --git a/auth/service.py b/auth/service.py
+index e4f5a6b..c7d8e9f 100644
+--- a/auth/service.py
++++ b/auth/service.py
+@@ -1,7 +1,9 @@
+ import hashlib
+ import time
+ import secrets
++import json
++import os
+ import logging
+ from auth.models import User, Session, LoginResult
+@@ -5,6 +7,9 @@ from auth.models import User, Session, LoginResult
+ MAX_FAILED_ATTEMPTS = 5
+ SESSION_TTL_SECONDS = 3600
+
++AUDIT_LOG_PATH = os.getenv("AUDIT_LOG_PATH", "/var/log/app/audit.log")
++
++
+ def hash_password(plain: str) -> str:
+     return hashlib.sha256(plain.encode()).hexdigest()
+
+@@ -13,6 +18,21 @@ def verify_password(stored_hash: str, plain: str) -> bool:
+     return stored_hash == hash_password(plain)
+
+
++def write_audit_log(event: str, user_id: int, metadata: dict = None) -> None:
++    entry = {
++        "timestamp": time.time(),
++        "event": event,
++        "user_id": user_id,
++        "metadata": metadata or {},
++    }
++    try:
++        with open(AUDIT_LOG_PATH, "a") as f:
++            f.write(json.dumps(entry) + "\n")
++    except OSError as e:
++        logger.error("Failed to write audit log: %s", e)
++
++
+ logger = logging.getLogger(__name__)
+
+ def authenticate(user: User, password: str) -> LoginResult:
+@@ -25,10 +45,13 @@ def authenticate(user: User, password: str) -> LoginResult:
+     if not verify_password(user.password_hash, password):
+         user.failed_login_attempts += 1
+         logger.warning(
+-            "Failed login attempt for user %s (attempt %d/%d)",
+-            user.email, user.failed_login_attempts, MAX_FAILED_ATTEMPTS
++            "Failed login attempt for user_id=%d (attempt %d/%d)",
++            user.id, user.failed_login_attempts, MAX_FAILED_ATTEMPTS
+         )
++        write_audit_log("login_failed", user.id, {"attempt": user.failed_login_attempts})
+         return LoginResult(success=False, error="Invalid credentials")
+
+     user.failed_login_attempts = 0
++    write_audit_log("login_success", user.id)
+     session = Session(
+         token=secrets.token_hex(32),
+         user_id=user.id,
