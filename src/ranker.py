@@ -5,8 +5,11 @@ Scores and sorts context items by relevance.
 
 Priority tiers (lower number = higher priority):
   1. function_body  — the actual changed function, always include
+  2. lsp_reference  — precise symbol reference from pyright
   2. call_site      — callers of the changed function, high risk of breakage
+  2. semantic_match — semantically similar code via embeddings
   3. test           — test coverage, shows expected behavior
+  3. git_cochange   — files that historically co-change (structural coupling)
   4. type_def       — type/class definitions, needed to understand data shapes
   5. import         — import list, useful but low information density
 """
@@ -20,6 +23,7 @@ PRIORITY_ORDER = {
     'call_site':      2,
     'semantic_match': 2,
     'test':           3,
+    'git_cochange':   3,   # historically coupled — same tier as test
     'type_def':       4,
     'import':         5,
 }

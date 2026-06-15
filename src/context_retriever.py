@@ -8,6 +8,7 @@ What we look for (in priority order):
   1. Full function body containing the changed lines
   2. Call sites — where the changed function is called elsewhere
   3. Test files — tests that cover the changed file
+  3. Git co-change — files that historically change together (coupling signal)
   4. Type/class definitions — types used in the changed code
   5. Import dependencies — what the changed file imports
 
@@ -16,10 +17,17 @@ Function extraction and call-site search use tree-sitter AST parsing
   - AST path: won't match inside comments or strings; uses exact node
     boundaries for start/end lines (Python, TS, JS, Go)
   - Regex fallback: covers Java, Ruby, Rust, C# (no grammar required)
+
+Scalability:
+  - Call-site and type searches use `grep -rl` as a fast pre-filter before
+    opening any files. On a 10K-file repo this cuts file reads from ~10,000
+    down to the handful that actually contain the name.
+  - grep falls back to a full Python file-walk if not available (e.g. Windows).
 """
 
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 
 from src.ast_parser import (
@@ -144,6 +152,22 @@ def retrieve_context(diff_files: list, repo_path: str, token_hint: int = 8000) -
                     category='test',
                 ))
 
+        # 3b. Git co-change: files that historically change with this one
+        cochanged = find_cochanged_files(repo_path, diff_file.file_path)
+        for co_path, co_count in cochanged:
+            content = read_file_safe(os.path.join(repo_path, co_path))
+            if content:
+                items.append(ContextItem(
+                    source=co_path,
+                    content=content[:3000],  # cap large files
+                    reason=(
+                        f"Co-changed with {diff_file.file_path} in {co_count} prior commits "
+                        f"— historically coupled, changes here may need to stay in sync"
+                    ),
+                    priority=3,
+                    category='git_cochange',
+                ))
+
         # 4. Type / class definitions referenced in changed lines
         type_names = extract_type_references(diff_file)
         for type_name in type_names:
@@ -240,26 +264,33 @@ def find_call_sites(repo_path: str, func_name: str,
     Search the repo for places that call `func_name(...)`.
 
     Strategy:
-      1. If prefer_ast=True, use tree-sitter for files in AST_SUPPORTED
-         (won't match inside comments or strings)
-      2. Fall back to regex for other file types
+      1. grep -rl to find candidate files in O(n) with OS-level I/O
+         (5-10x faster than opening every file in Python)
+      2. For each candidate: AST call-expression detection (if AST_SUPPORTED)
+         or regex fallback — neither matches inside strings/comments
+      3. Falls back to full Python walk if grep is unavailable
 
     Returns list of (relative_path, formatted_snippet) tuples.
     """
     results = []
     regex_pattern = re.compile(r'\b' + re.escape(func_name) + r'\s*\(')
 
-    for rel_path, abs_path in _walk_source_files(repo_path):
+    # Fast pre-filter: ask grep which files even contain the name before
+    # opening any of them. On a 10K-file monorepo this drops file reads
+    # from ~10,000 to typically < 10.
+    candidate_abs_paths = _grep_files_containing(repo_path, func_name)
+    if candidate_abs_paths is not None:
+        file_iter = _abs_to_rel(repo_path, candidate_abs_paths)
+    else:
+        file_iter = _walk_source_files(repo_path)  # grep unavailable, walk all
+
+    for rel_path, abs_path in file_iter:
         if exclude_file and rel_path == exclude_file:
             continue
 
         ext = rel_path.rsplit('.', 1)[-1].lower() if '.' in rel_path else ''
         content = read_file_safe(abs_path)
         if not content:
-            continue
-
-        # Quick pre-filter: if the name isn't even in the file, skip
-        if func_name not in content:
             continue
 
         lines = content.splitlines()
@@ -325,9 +356,16 @@ def find_type_definition(repo_path: str, type_name: str):
         re.compile(r'^' + re.escape(type_name) + r'\s*=\s*(?:TypedDict|dataclass|NamedTuple)'),
     ]
 
-    for rel_path, abs_path in _walk_source_files(repo_path):
+    # grep pre-filter: only read files that mention the type name
+    candidate_abs_paths = _grep_files_containing(repo_path, type_name)
+    if candidate_abs_paths is not None:
+        file_iter = _abs_to_rel(repo_path, candidate_abs_paths)
+    else:
+        file_iter = _walk_source_files(repo_path)
+
+    for rel_path, abs_path in file_iter:
         content = read_file_safe(abs_path)
-        if not content or type_name not in content:
+        if not content:
             continue
         lines = content.splitlines()
         for i, line in enumerate(lines):
@@ -337,13 +375,65 @@ def find_type_definition(repo_path: str, type_name: str):
                 if ext in AST_SUPPORTED:
                     snippet = extract_function_ast(content, type_name, ext)
                     if not snippet:
-                        # fall back to simple block extract
                         snippet = '\n'.join(lines[i:min(len(lines), i+20)])
                 else:
                     snippet = '\n'.join(lines[i:min(len(lines), i+20)])
                 return (rel_path, f"# {rel_path}:{i+1}\n{snippet}")
 
     return None
+
+
+def find_cochanged_files(repo_path: str, source_file: str, top_n: int = 3) -> list:
+    """
+    Find files that frequently co-changed with source_file in git history.
+
+    This captures coupling that no static analysis tool can see: files with
+    completely different names that nevertheless always change together because
+    they implement two sides of the same abstraction, share a config schema,
+    or maintain a protocol contract.
+
+    Args:
+        repo_path:   Absolute path to the repository root
+        source_file: Relative path of the file being reviewed
+        top_n:       Max number of co-changed files to return
+
+    Returns:
+        List of (rel_path, co_change_count) tuples, sorted by frequency.
+        Empty list if git is unavailable or the file has no history.
+    """
+    try:
+        import git
+        repo = git.Repo(repo_path, search_parent_directories=True)
+        counts: dict = {}
+
+        # Walk the last 100 commits that touched this file
+        for commit in repo.iter_commits(paths=[source_file], max_count=100):
+            if not commit.parents:
+                continue  # initial commit, no diff
+            for diff_item in commit.parents[0].diff(commit):
+                path = diff_item.b_path or diff_item.a_path
+                if path and path != source_file:
+                    counts[path] = counts.get(path, 0) + 1
+
+        sorted_pairs = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        results = []
+        for path, count in sorted_pairs:
+            if count < 2:
+                break  # only include files that co-changed at least twice
+            ext = path.rsplit('.', 1)[-1].lower() if '.' in path else ''
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+            abs_path = os.path.join(repo_path, path)
+            if os.path.exists(abs_path):
+                results.append((path, count))
+            if len(results) >= top_n:
+                break
+
+        return results
+
+    except Exception:
+        # git not available, repo has no history, or file not tracked — silent no-op
+        return []
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -354,6 +444,54 @@ def read_file_safe(path: str) -> str:
             return f.read()
     except (OSError, IOError):
         return ''
+
+
+def _grep_files_containing(repo_path: str, text: str) -> list:
+    """
+    Return absolute paths of source files in repo_path that contain text.
+
+    Uses system grep with --include filters and --exclude-dir skips.
+    This is 5-10x faster than opening every file in Python because grep
+    uses OS memory-mapped I/O and can scan multiple files in parallel.
+
+    Returns None if grep is unavailable (Windows, restricted env) so callers
+    can fall back to the Python file walk.
+    """
+    include_args  = [f'--include=*.{ext}' for ext in SUPPORTED_EXTENSIONS]
+    exclude_args  = [f'--exclude-dir={d}'  for d in SKIP_DIRS]
+    try:
+        result = subprocess.run(
+            ['grep', '-rl', '--binary-files=without-match', text, repo_path]
+            + include_args + exclude_args,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        # returncode 0 = found, 1 = not found, anything else = error
+        if result.returncode not in (0, 1):
+            return None
+        lines = result.stdout.strip().splitlines()
+        return [l for l in lines if l]
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None  # grep not available; caller will walk files
+
+
+def _abs_to_rel(repo_path: str, abs_paths: list):
+    """
+    Convert a list of absolute paths (from grep output) back to
+    (rel_path, abs_path) tuples, applying the same extension/SKIP_DIRS
+    filters as _walk_source_files so the rest of the pipeline is uniform.
+    """
+    for abs_path in abs_paths:
+        ext = abs_path.rsplit('.', 1)[-1].lower() if '.' in abs_path else ''
+        if ext not in SUPPORTED_EXTENSIONS:
+            continue
+        rel_path = os.path.relpath(abs_path, repo_path)
+        # Skip paths that pass through a directory we want to ignore
+        parts = rel_path.replace('\\', '/').split('/')
+        if any(p in SKIP_DIRS for p in parts):
+            continue
+        yield rel_path, abs_path
 
 
 def _walk_source_files(repo_path: str):

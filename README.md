@@ -191,6 +191,7 @@ codity/
 │
 ├── main.py                   # CLI entry point
 ├── design_doc.md             # Architecture, tradeoffs, scaling considerations
+├── evaluation.md             # 3 worked examples with retrieval plans, token counts, exclusions
 ├── requirements.txt
 └── .env.example
 ```
@@ -202,10 +203,15 @@ codity/
 | 1 | `function_body` | tree-sitter AST | The changed function in full — always include |
 | 2 | `lsp_reference` | pyright LSP | Precise symbol reference — resolved, not matched |
 | 2 | `semantic_match` | Voyage AI embeddings | Conceptually related code keyword search misses |
-| 2 | `call_site` | tree-sitter AST | Direct caller — high breakage risk |
+| 2 | `call_site` | grep + tree-sitter AST | Direct caller — high breakage risk |
 | 3 | `test` | filename heuristic | Expected behavior contract |
-| 4 | `type_def` | regex + AST | Data shape context |
+| 3 | `git_cochange` | gitpython log | Files that historically co-change — structural coupling invisible to static analysis |
+| 4 | `type_def` | grep + regex/AST | Data shape context |
 | 5 | `import` | tree-sitter AST | Dependency graph |
+
+Call-site and type-definition searches use `grep -rl` as a fast pre-filter before opening
+any files. On a 10K-file repo this cuts file reads from ~10,000 to the handful that actually
+contain the name, making the tool fast on large open-source codebases.
 
 ## Cost Model
 
