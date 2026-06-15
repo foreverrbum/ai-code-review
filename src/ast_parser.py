@@ -30,28 +30,32 @@ from tree_sitter import Language, Parser, Node
 # Each grammar is a compiled C library exposed via a Python binding.
 # We load them lazily so missing packages don't break the whole system.
 
-def _load_language(module_name: str, lang_name: str) -> Optional[Language]:
+def _load_language(module_name: str, func_name: str, lang_name: str) -> Optional[Language]:
     try:
         mod = __import__(module_name)
-        return Language(mod.language(), lang_name)
-    except (ImportError, Exception):
+        fn = getattr(mod, func_name)   # e.g. mod.language() or mod.language_typescript()
+        return Language(fn(), lang_name)
+    except (ImportError, AttributeError, Exception):
         return None
 
 _LANGUAGES = {}
 
 def _get_language(ext: str) -> Optional[Language]:
     if ext not in _LANGUAGES:
+        # (module_name, exported_function_name, tree-sitter language name)
+        # tree_sitter_typescript is the odd one out: it exports language_typescript()
+        # and language_tsx() rather than the generic language() that all other grammars use.
         mapping = {
-            'py':  ('tree_sitter_python',     'python'),
-            'js':  ('tree_sitter_javascript', 'javascript'),
-            'jsx': ('tree_sitter_javascript', 'javascript'),
-            'ts':  ('tree_sitter_typescript', 'typescript'),
-            'tsx': ('tree_sitter_typescript', 'tsx'),
-            'go':  ('tree_sitter_go',         'go'),
+            'py':  ('tree_sitter_python',     'language',             'python'),
+            'js':  ('tree_sitter_javascript', 'language',             'javascript'),
+            'jsx': ('tree_sitter_javascript', 'language',             'javascript'),
+            'ts':  ('tree_sitter_typescript', 'language_typescript',  'typescript'),
+            'tsx': ('tree_sitter_typescript', 'language_tsx',         'tsx'),
+            'go':  ('tree_sitter_go',         'language',             'go'),
         }
         if ext in mapping:
-            module_name, lang_name = mapping[ext]
-            _LANGUAGES[ext] = _load_language(module_name, lang_name)
+            module_name, func_name, lang_name = mapping[ext]
+            _LANGUAGES[ext] = _load_language(module_name, func_name, lang_name)
         else:
             _LANGUAGES[ext] = None
     return _LANGUAGES[ext]
@@ -63,8 +67,8 @@ FUNCTION_NODE_TYPES = {
     'py':  (['function_definition', 'decorated_definition'], 'name'),
     'js':  (['function_declaration', 'method_definition', 'arrow_function'], 'name'),
     'jsx': (['function_declaration', 'method_definition', 'arrow_function'], 'name'),
-    'ts':  (['function_declaration', 'method_definition', 'function_signature'], 'name'),
-    'tsx': (['function_declaration', 'method_definition', 'function_signature'], 'name'),
+    'ts':  (['function_declaration', 'method_definition', 'function_signature', 'arrow_function'], 'name'),
+    'tsx': (['function_declaration', 'method_definition', 'function_signature', 'arrow_function'], 'name'),
     'go':  (['function_declaration', 'method_declaration'], 'name'),
 }
 
