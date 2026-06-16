@@ -4,14 +4,36 @@ A CLI tool that takes a Git PR diff and retrieves the most relevant surrounding 
 
 ## The Problem
 
-Sending only a diff to an LLM gives it too little context. Sending the whole codebase is too expensive and degrades review quality through context dilution. This system retrieves exactly what's needed using four complementary methods:
+Sending only the diff gives an LLM too little context: it misses callers, type definitions, and the behavioral contract in tests. Sending the whole codebase is too expensive and degrades quality through context dilution. This system retrieves exactly what matters, ranks it by relevance, and enforces a token budget.
+
+## Core System
+
+The base tool runs with no external API keys beyond your Anthropic key and no special binaries:
+
+```bash
+python main.py --diff my.diff --repo /path/to/repo
+```
+
+It retrieves context via five methods that run on every PR:
 
 | Method | What it finds |
 |---|---|
-| tree-sitter AST | Precise function bodies, call expressions, import statements |
-| pyright LSP | Symbol-resolved references (not text search — follows the actual symbol) |
-| Voyage AI embeddings | Semantically similar code even with different names |
-| Keyword / test matching | Related test files by naming convention |
+| tree-sitter AST | Precise function bodies, call sites, imports (Python, TS, JS, Go) |
+| grep pre-filter | Finds candidate files in O(1) I/O before opening anything — fast on large repos |
+| Test file matching | Test files covering the changed module, by naming convention |
+| Git co-change | Files that historically co-change with the modified file — structural coupling AST cannot see |
+| Token budget | Drops low-priority items when context exceeds 8,000 tokens; always fits function bodies first |
+
+## Optional Layers
+
+Two flags add more signal at the cost of latency and external dependencies:
+
+| Flag | What it adds | Latency | Requires |
+|---|---|---|---|
+| `--semantic` | Voyage AI embeddings — finds conceptually similar code that shares no keywords with the changed function | ~5s index build on first run | `VOYAGE_API_KEY` |
+| `--lsp` | pyright symbol resolution — follows re-exports and subclass overrides, not text matching | ~2s pyright startup | `pyright-langserver` binary |
+
+**When to use them:** batch CI mode on Python-heavy repos where symbol precision or semantic similarity matters. Neither flag is recommended for interactive use — the base system produces good results for the vast majority of PRs without them.
 
 ## How It Works
 
@@ -19,16 +41,16 @@ Sending only a diff to an LLM gives it too little context. Sending the whole cod
 PR diff (local file or GitHub PR)
          │
          ▼
-[1] Parse diff       → which files, functions, lines changed? (tree-sitter)
+[1] Parse diff       → which files, functions, lines changed?
          │
          ▼
-[2] Retrieve context → function bodies, call sites, tests, types, semantic matches
-         │   (AST + LSP + embeddings run in parallel)
+[2] Retrieve context → function bodies, call sites, tests, git co-change, type defs, imports
+         │             (grep pre-filter for speed; optional: LSP + embeddings)
          ▼
 [3] Rank             → priority 1 (function body) → 5 (imports)
          │
          ▼
-[4] Apply budget     → trim to 8,000 token limit
+[4] Apply budget     → trim to 8,000 token limit; log what was excluded and why
          │
          ▼
 [5] Claude review    → prompt cached for 90% cost reduction on repeat calls
@@ -49,103 +71,93 @@ cp .env.example .env
 
 Edit `.env`:
 ```
-ANTHROPIC_API_KEY=sk-ant-...      # console.anthropic.com
-VOYAGE_API_KEY=pa-...             # dash.voyageai.com → API Keys
-GITHUB_TOKEN=ghp_...              # github.com/settings/tokens → repo scope
+ANTHROPIC_API_KEY=sk-ant-...      # required — console.anthropic.com
+VOYAGE_API_KEY=pa-...             # optional — enables --semantic (dash.voyageai.com)
+GITHUB_TOKEN=ghp_...              # optional — enables --github (github.com/settings/tokens)
 ```
-
-Only `ANTHROPIC_API_KEY` is required for basic use. `VOYAGE_API_KEY` enables semantic search (`--semantic`). `GITHUB_TOKEN` enables GitHub PR fetching (`--github`).
 
 ## Usage
 
 ```bash
-# Basic review using a local diff file
-python main.py --diff examples/example1_bugfix.diff --repo examples/sample_repo
+# Review using a local diff — core system, no external API keys needed beyond Anthropic
+python main.py --diff my.diff --repo /path/to/repo
 
-# Show retrieval plan only — no API call, no cost
+# Show retrieval plan only — no Claude API call, no cost
+python main.py --diff my.diff --repo /path/to/repo --no-llm
+
+# Review a real GitHub PR (requires GITHUB_TOKEN in .env)
+python main.py --github owner/repo/pull/123 --repo /path/to/local/clone
+
+# Try the included example
 python main.py --diff examples/example1_bugfix.diff --repo examples/sample_repo --no-llm
 
-# Full production mode: AST + LSP + semantic search
-python main.py \
-  --diff examples/example1_bugfix.diff \
-  --repo examples/sample_repo \
-  --lsp       \   # precise symbol references via pyright
-  --semantic      # semantic similarity via Voyage AI
-
-# Review a real GitHub PR
-python main.py \
-  --github owner/repo/pull/123 \
-  --repo /path/to/local/clone \
-  --lsp --semantic
-
 # Generate a diff from any git repo and pipe it in
-git diff main..my-feature-branch > my_pr.diff
-python main.py --diff my_pr.diff --repo /path/to/repo
+git diff main..feature-branch > my.diff
+python main.py --diff my.diff --repo /path/to/repo
 
-# Adjust token budget (default: 8,000)
-python main.py --diff my.diff --repo my/repo --budget 4000
+# Tighten the token budget to force more aggressive exclusions (default: 8,000)
+python main.py --diff my.diff --repo /path/to/repo --budget 4000
+
+# Optional: add semantic search (requires VOYAGE_API_KEY) or LSP (requires pyright-langserver)
+python main.py --diff my.diff --repo /path/to/repo --semantic
+python main.py --diff my.diff --repo /path/to/repo --lsp
 ```
 
 ## Example Output
+
+Real run against [psf/requests#7505](https://github.com/psf/requests/pull/7505)
+(`python main.py --github psf/requests/pull/7505 --repo ./requests --no-llm`):
 
 ```
 ============================================================
 STEP 1: PARSING DIFF
 ============================================================
-PR touches 1 file(s):
-  auth/service.py  +9/-2 lines  [verify_password, authenticate]
+PR touches 3 file(s):
+  src/requests/_types.py  +5/-0 lines  [SupportsRead, has_read]
+  src/requests/models.py  +4/-7 lines  [_encode_params, _encode_files, prepare_body]
+  tests/test_requests.py  +15/-0 lines  [test_post_named_tempfile, ...]
 
 ============================================================
 STEP 2: RETRIEVING CONTEXT
 ============================================================
-  Running LSP reference resolution (pyright)...
-  + 1 LSP reference(s)
-  Building semantic index for examples/sample_repo...
-  Extracted 22 function chunks. Embedding...
-  Index built: 22 chunks, matrix shape (22, 1536)
-  + 4 semantic match(es)
-
-Found 12 context item(s) total
+Found 21 context item(s) total
 
 ============================================================
 STEP 3: RANKING
 ============================================================
 === RETRIEVAL PLAN ===
 
-1. [FUNCTION_BODY] auth/service.py
-   Priority: 1 | Why: Full body of `authenticate` — AST-extracted
+1. [FUNCTION_BODY] src/requests/models.py
+   Priority: 1 | Why: Full body of `_encode_files` — AST-extracted
 
-2. [LSP_REFERENCE] auth/service.py
-   Priority: 2 | Why: LSP-resolved reference to `verify_password` (line 25)
-                       — precise symbol match, not a text search
+2. [FUNCTION_BODY] src/requests/_types.py
+   Priority: 1 | Why: Full body of `has_read` — AST-extracted
 
-3. [SEMANTIC_MATCH] tests/test_auth.py
-   Priority: 2 | Why: Semantically similar (similarity=0.84, func=`test_wrong_password_fails`)
+3. [CALL_SITE] src/requests/models.py
+   Priority: 2 | Why: Call site of `has_read` — changes here may break callers
 
-4. [CALL_SITE] tests/test_auth.py
-   Priority: 2 | Why: Call site of `authenticate` — changes here may break callers
+4. [GIT_COCHANGE] src/requests/models.py
+   Priority: 3 | Why: Co-changed with _types.py in 4 prior commits
+                       — historically coupled, changes here may need to stay in sync
+
+5. [GIT_COCHANGE] src/requests/sessions.py
+   Priority: 3 | Why: Co-changed with _types.py in 3 prior commits
+
+6. [TYPE_DEF] src/requests/_types.py
+   Priority: 4 | Why: Definition of `SupportsRead` used in changed code
 ...
 
 ============================================================
 STEP 4: APPLYING TOKEN BUDGET
 ============================================================
 Budget:            8,000 tokens
-Context used:      1,214 tokens (12 items)
-Estimated total:   1,739 tokens
+Context used:      5,928 tokens (20 items)
+Excluded:          1 item(s) (over budget)
+Diff tokens:         861
+Estimated total:   6,989 tokens
 
-============================================================
-STEP 5: CLAUDE CODE REVIEW
-============================================================
-[Claude's review appears here]
-
-============================================================
-=== TOKEN & COST REPORT ===
-  Input tokens:    1,847
-  Output tokens:   412
-  Cache written:   1,203 tokens ($0.0045)
-  Cache read:      0 tokens ($0.0000)
-  Total per PR:    $0.0118
-  Cost per 1K PRs: $11.80
+Excluded (would exceed budget):
+  - [test] tests/test_requests.py (~27,109 tokens)
 ```
 
 ## Project Structure
@@ -156,42 +168,37 @@ codity/
 │   ├── diff_parser.py        # Parse git unified diffs → DiffFile objects
 │   │                         # Extracts changed files, functions, added/removed lines
 │   │
-│   ├── ast_parser.py         # tree-sitter AST parsing (NEW)
+│   ├── ast_parser.py         # tree-sitter AST parsing
 │   │                         # Precise function extraction + call-site detection
 │   │                         # Supports: Python, TypeScript, JavaScript, Go
 │   │
 │   ├── context_retriever.py  # Orchestrates all retrieval methods
-│   │                         # AST-first with regex fallback for unsupported languages
-│   │
-│   ├── embeddings.py         # Voyage AI semantic search (NEW)
-│   │                         # voyage-code-2 embeddings + numpy cosine similarity
-│   │                         # No external vector DB required
-│   │
-│   ├── lsp_client.py         # pyright LSP integration (NEW)
-│   │                         # JSON-RPC over stdio, textDocument/references
-│   │                         # Precise symbol resolution, not text matching
+│   │                         # grep pre-filter, git co-change, test matching, type defs
 │   │
 │   ├── ranker.py             # Priority-based sorting of context items
 │   │
 │   ├── token_budget.py       # Token estimation, budget enforcement, cost reporting
-│   │                         # Includes prompt cache hit/miss accounting
 │   │
-│   ├── reviewer.py           # Claude API with prompt caching (NEW)
-│   │                         # System prompt + context block cached (cache_control)
-│   │                         # Diff block not cached (unique per PR)
+│   ├── reviewer.py           # Claude API with prompt caching
+│   │                         # System prompt + context cached; diff not cached
 │   │
-│   └── github_client.py      # GitHub API integration (NEW)
-│                             # Fetch PR diffs, metadata; post reviews back to GitHub
+│   ├── embeddings.py         # [optional] Voyage AI semantic search
+│   │                         # voyage-code-2 embeddings + numpy cosine similarity
+│   │
+│   ├── lsp_client.py         # [optional] pyright LSP integration
+│   │                         # JSON-RPC over stdio, textDocument/references
+│   │
+│   └── github_client.py      # GitHub API — fetch PR diffs and post reviews
 │
 ├── examples/
 │   ├── sample_repo/          # Synthetic Python codebase (auth + payments + tests)
-│   ├── example1_bugfix.diff  # Adding logging to auth failure path
-│   ├── example2_refactor.diff # Refactoring payment processor + adding session check
-│   └── example3_new_feature.diff # Adding audit logging to auth events
+│   ├── example1_bugfix.diff
+│   ├── example2_refactor.diff
+│   └── example3_new_feature.diff
 │
 ├── main.py                   # CLI entry point
 ├── design_doc.md             # Architecture, tradeoffs, scaling considerations
-├── evaluation.md             # 3 worked examples with retrieval plans, token counts, exclusions
+├── evaluation.md             # 3 real open-source PRs with retrieval plans and token data
 ├── requirements.txt
 └── .env.example
 ```
